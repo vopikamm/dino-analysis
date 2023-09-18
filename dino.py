@@ -6,6 +6,7 @@ import cftime as cft
 import f90nml
 import numpy        as np
 from xesmf import Regridder
+from math import ceil, floor
 
 from pathlib import Path, PurePath
 
@@ -179,6 +180,47 @@ class Experiment:
 
         return(extrapolator(lr.isel(x=slice(1,-1), y=slice(1,-1))))
     
+    def transform_to_density(self, var):
+        """Transforming a variable (vertical T-point: z_c) to density coordinates."""
+        # Cut out bottom layer of z_c, such that z_f is outer (land anyway)
+        ds_top = self.data.isel(z_c=slice(0,-1))
+
+        # Compute density if necessary
+        if 'rhop' not in list(self.data.keys()):
+            rho = self.get_rho().isel(z_c=slice(0,-1)).rename('rhop')
+        else:
+            rho = ds_top.rhop
+        rho = rho.where(self.domain.tmask == 1.0)
+        # define XGCM grid object with outer dimension z_f 
+        grid = xg.Grid(ds_top,
+            coords={
+                "X": {"right": "x_f", "center":"x_c"},
+                "Y": {"right": "y_f", "center":"y_c"},
+                "Z": {"center": "z_c", "outer": "z_f"}
+            },
+            metrics=xn.get_metrics(ds_top),
+            periodic=False
+        )
+
+        # Interpolate sigma2 on the cell faces
+        rho_var = grid.interp_like(rho, var.isel(z_c=slice(0,-1)))
+        rho_out = grid.interp(rho_var, 'Z',  boundary='extend')
+
+        # Target values for density coordinate
+        rho_tar = np.linspace(
+            floor(rho_out.min().values),
+            ceil(rho_out.max().values),
+            36
+        )
+        # Transform variable to density coordinates:
+        var_transformed = grid.transform(var.isel(z_c=slice(0,-1)),
+            'Z',
+            rho_tar,
+            method='conservative',
+            target_data=rho_out
+        )
+        return(var_transformed)
+
     def get_T_star(self):
         """ Compute the temperature restoring profile. """
         return((self.data.qns + self.data.empmr * self.data.sst * 3991.86795 + self.data.qsr) / ( 40.) + self.data.sst)
@@ -201,17 +243,21 @@ class Experiment:
     
     def get_BTS(self):
         """ Compute the BaroTropic Streamfunction. """
-        # Copy data
-        _data_grid          = self.domain.copy()
-        # Adding velocities and e3s to the data_grid
-        _data_grid['uoce']  = (['t_y','z_c', 'y_c', 'x_f'], self.data.uoce.data)
-        _data_grid['e3u']   = (['t_y','z_c', 'y_c', 'x_f'], self.data.e3u.data)
-        # Interpolating on u_f
-        _data_grid['u_on_f'] = self.grid.interp(_data_grid.uoce, 'Y')
-        # Integrating over depth
-        _data_grid['U']      = self.grid.integrate(_data_grid.u_on_f, 'Z')
-        # Cumulative integral over x
-        return((_data_grid.U[-1,::-1,:] * _data_grid.e2f[::-1,:]).cumsum('y_f') / 1e6)
+        # Interpolating u, e3u on f-points
+        u_on_f  = self.grid.interp(self.data.uoce, 'Y')
+        e3_on_f = self.grid.interp(self.data.e3u, 'Y')
+        # Vertical integral
+        U = (u_on_f * e3_on_f).sum('z_c')
+        # Cumulative integral over y
+        bts = (U[:,::-1,:] * self.domain.e2f[::-1,:]).cumsum('y_f') / 1e6
+        return(bts)
+    
+    def get_MOC(self, var):
+        """ Compute the Meridional Overturning Streamfunction of transport variable `var`. """
+        var_tra = self.transform_to_density(var=var)
+        moc = var_tra.sum(dim='x_c')[:,:,::-1].cumsum('rhop') / 1e6
+        moc = moc.assign_coords(dict({'y_f': self.domain.gphif.isel(x_f=0).values}))
+        return(moc)
     
     def get_ACC(self):
         """
