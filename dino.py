@@ -5,6 +5,7 @@ import xnemogcm     as xn
 import cftime as cft
 import f90nml
 import numpy        as np
+from xesmf import Regridder
 
 from pathlib import Path, PurePath
 
@@ -17,26 +18,35 @@ class Experiment:
         self.domain         = self.open_domain()
         self.namelist       = self.open_namelist()
         self.grid           = xg.Grid(self.domain, metrics=xn.get_metrics(self.domain), periodic=False)
+        #chunks              = dict({'t_y':10, 't_m':120, 't_0':360})
         try:
             self.yearly         = self.open_data('DINO_1y_grid_*')
         except:
             self.yearly         = None
+            #chunks.pop('t_y')
         try:
             self.monthly        = self.open_data('DINO_1m_grid_*')
         except:
             self.monthly        = None
+            #chunks.pop('t_m')
+        try:
+            self.d10            = self.open_data('DINO_10d_grid_*')
+        except:
+            self.d10            = None
+            #chunks.pop('t_0')
         self.data           = xr.merge(
-            [i for i in [self.yearly, self.monthly] if i is not None],
+            [i for i in [self.yearly, self.monthly, self.d10] if i is not None],
             compat='minimal'
-        )
+        )#.chunk(chunks=chunks)
     
     def get_restarts(self):
         """" Detect restart folders if they exist and return their names."""
         restarts = []
-        for paths in sorted(Path(self.path).iterdir()):
-            if paths.is_dir():
-                restarts.append(PurePath(paths).name)
-        if len(restarts)==0:
+        try:
+            for paths in sorted(Path(self.path).iterdir(), key=lambda x: float(x.name.strip('restart'))):
+                if paths.is_dir():
+                    restarts.append(PurePath(paths).name)
+        except:
             restarts.append('')
         return(restarts)
     
@@ -58,18 +68,18 @@ class Experiment:
         else:
             return(None)
     
-    def open_namelist(self):
+    def open_namelist(self, restart=0):
         """ Open the namelist_cfg as a f90nml dict."""
         namelist = f90nml.read(
-            self.path + self.restarts[0] + '/namelist_cfg'
+            self.path + self.restarts[restart] + '/namelist_cfg'
         )
         return(namelist)
     
-    def open_restart(self, name):
+    def open_restart(self, restart_path=None):
         """ Open one or multiple restart files."""
         restart_files = []
         for paths in sorted(Path(self.path).iterdir()):
-            if name in PurePath(paths).name:
+            if (str(self.namelist['namrun']['nn_itend']) + '_restart') in PurePath(paths).name:
                 restart_files.append(PurePath(paths))
 
         ds = xr.open_mfdataset(
@@ -87,10 +97,10 @@ class Experiment:
             "DOMAIN_size_local",
         ]:
             ds.attrs.pop(i, None)
-        ds.assign_coords(dict(
+        ds = ds.assign_coords(dict(
             lon=(["y", "x"], self.domain.glamt.values),
             lat=(["y", "x"], self.domain.gphit.values)
-        ))
+        )).drop_vars(['x', 'y'])
         return(ds)
 
     def add_sigma_levels(self):
@@ -102,11 +112,72 @@ class Experiment:
         ][0]
         self.domain['sigma_levels'] = (['z_f', 'y_c', 'x_c'], levels)
     
-    def regrid_restart(self, from_restart, to_restart, to_netcdf=False):
+    def regrid_restart(self, other):
         """Regridding a restart file to the horizontal resolution of another. """
-        
+        _lr = self.open_restart()
+        lr = self.extrapolate_restart_on_land(lr=_lr)
+        hr = other.open_restart()
 
+        dt = other.namelist['namdom']['rn_Dt']
 
+        # initiate Regridder
+        regridder = Regridder(lr, hr, "bilinear",  extrap_method="nearest_s2d", ignore_degenerate=True)
+        restart_regrid = regridder(lr)
+
+        # apply high resolution mask
+        restart_regrid *= xr.where(hr.tn.isel(nav_lev=0, time_counter=0)==0.0, 0, 1)
+
+        # set velocities to zero
+        restart_regrid['ub'].loc[:] = 0.0
+        restart_regrid['un'].loc[:] = 0.0
+        restart_regrid['vb'].loc[:] = 0.0
+        restart_regrid['vn'].loc[:] = 0.0
+
+        # assign missing values from hr/lr dataset and change time_step
+        restart_regrid['lon'] = hr.lon
+        restart_regrid['lat'] = hr.lat
+        restart_regrid['kt'] = _lr.kt
+        restart_regrid['ndastp'] = _lr.ndastp
+        restart_regrid['adatrj'] = _lr.adatrj
+        restart_regrid['ntime'] = _lr.ntime
+        restart_regrid['rdt'] = dt
+
+        # order as the high resolution datset
+        restart_regrid = restart_regrid[list(hr.keys())]
+
+        return(restart_regrid)
+
+    def extrapolate_restart_on_land(self, lr):
+        """ 
+        Extrapolating a restart dataset onto land points.
+        This is necessary for LR --> HR regridding.
+        """
+        res = self.namelist['namusr_def']['rn_e1_deg']
+        # Create a dummy datasat on the land-points
+        temp_p  = np.concatenate((lr.tn.values, lr.tn.values[:,:,:,-2:]+2*res), axis=3)
+        lon_p   = np.concatenate((lr.lon.values, lr.lon.values[:,-2:]+2*res), axis=1)
+        lat_p   = np.concatenate((lr.lat.values, lr.lat.values[:,-2:]+2*res), axis=1)
+        # define data with variable attributes
+        data_vars = {
+            'temperature':(
+                ['time_counter', 'nav_lev', 'y_c', 'x_c'], temp_p, 
+                                 {'units': 'C'}
+            )
+        }
+        # define coordinates
+        coords = {  'time_counter': ('time_counter', lr.time_counter.values),
+                    'nav_lev': ('nav_lev', lr.nav_lev.values),
+                    'lat': (['y', 'x'], lat_p),
+                    'lon': (['y', 'x'], lon_p)
+                  }
+        # create dataset
+        ds_lr = xr.Dataset(data_vars=data_vars, 
+                        coords=coords, 
+        )
+        # Initiate extrapolator
+        extrapolator = Regridder(lr.isel(x=slice(1,-1), y=slice(1,-1)), ds_lr, "nearest_s2d")
+
+        return(extrapolator(lr.isel(x=slice(1,-1), y=slice(1,-1))))
     
     def get_T_star(self):
         """ Compute the temperature restoring profile. """
@@ -148,7 +219,7 @@ class Experiment:
 
         Defined as the volume transport through the zonal boundaries.        
         """
-        acc = (self.data.uoce.isel(x_f=0) * self.data.e3u.isel(x_f=0) * self.domain.e2u.isel(x_f=0)).sum(['y_c', 'z_c']) / 1e6
+        acc = (self.data.uoce.isel(x_f=0) * self.domain.e3u_0.isel(x_f=0) * self.domain.e2u.isel(x_f=0)).sum(['y_c', 'z_c']) / 1e6
         return(acc)
 
 
