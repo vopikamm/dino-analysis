@@ -180,14 +180,14 @@ class Experiment:
 
         return(extrapolator(lr.isel(x=slice(1,-1), y=slice(1,-1))))
     
-    def transform_to_density(self, var):
+    def transform_to_density(self, var, isel={'t_y':-1}):
         """Transforming a variable (vertical T-point: z_c) to density coordinates."""
         # Cut out bottom layer of z_c, such that z_f is outer (land anyway)
-        ds_top = self.data.isel(z_c=slice(0,-1))
+        ds_top = self.data.isel(z_c=slice(0,-1), **isel)
 
         # Compute density if necessary
         if 'rhop' not in list(self.data.keys()):
-            rho = self.get_rho().isel(z_c=slice(0,-1)).rename('rhop')
+            rho = self.get_rho().isel(z_c=slice(0,-1), **isel).rename('rhop')
         else:
             rho = ds_top.rhop
         rho = rho.where(self.domain.tmask == 1.0)
@@ -203,7 +203,7 @@ class Experiment:
         )
 
         # Interpolate sigma2 on the cell faces
-        rho_var = grid.interp_like(rho, var.isel(z_c=slice(0,-1)))
+        rho_var = grid.interp_like(rho, var)
         rho_out = grid.interp(rho_var, 'Z',  boundary='extend')
 
         # Target values for density coordinate
@@ -213,7 +213,8 @@ class Experiment:
             36
         )
         # Transform variable to density coordinates:
-        var_transformed = grid.transform(var.isel(z_c=slice(0,-1)),
+        var_transformed = grid.transform(
+            var,
             'Z',
             rho_tar,
             method='conservative',
@@ -252,10 +253,15 @@ class Experiment:
         bts = (U[:,::-1,:] * self.domain.e2f[::-1,:]).cumsum('y_f') / 1e6
         return(bts)
     
-    def get_MOC(self, var):
+    def get_MOC(self, var, isel={'t_y':-1}):
         """ Compute the Meridional Overturning Streamfunction of transport variable `var`. """
-        var_tra = self.transform_to_density(var=var)
-        moc = var_tra.sum(dim='x_c')[:,:,::-1].cumsum('rhop') / 1e6
+        # Prepare the meridional transport:
+        if var.name == 'vocetr_eff':
+            var = var.isel(z_c=slice(0,-1), **isel)
+        else:
+            var = (var * self.data.e3v * self.domain.e1v).isel(z_c=slice(0,-1), **isel)
+        var_tra = self.transform_to_density(var=var, isel=isel)
+        moc = var_tra.sum(dim='x_c')[...,::-1].cumsum('rhop') / 1e6
         moc = moc.assign_coords(dict({'y_f': self.domain.gphif.isel(x_f=0).values}))
         return(moc)
     
