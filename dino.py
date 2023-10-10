@@ -224,7 +224,31 @@ class Experiment:
 
     def get_T_star(self):
         """ Compute the temperature restoring profile. """
-        return((self.data.qns + self.data.empmr * self.data.sst * 3991.86795 + self.data.qsr) / ( 40.) + self.data.sst)
+        return(self.data.sst - (self.data.qns + self.data.empmr * self.data.sst * 3991.86795 + self.data.qsr) / self.namelist['namusr_def']['rn_trp'])
+        
+    
+    def get_S_star(self):
+        """ Compute the salinity restoring profile. """
+        if 'saltflx' in list(self.data.keys()):
+            return(self.data.sss - self.data.sflx  / self.namelist['namusr_def']['rn_srp'])
+        else:
+            print('Warning: saltflux is not in the dataset. Assumed shape by Romain Caneill (2022).')
+            return(37.12 * np.exp(- self.domain.gphit**2 / 260.**2 ) - 1.1 * np.exp( - self.domain.gphit**2 / 7.5**2 ))
+    
+    def get_rho_star(self):
+        """ Compute the density restoring profile from salinity and temperature restoring. """
+        T_star = self.get_T_star()
+        S_star = self.get_S_star()
+        nml = self.namelist['nameos']
+        if nml['ln_seos']:
+            rho = (
+                - nml['rn_a0'] * (1. + 0.5 * nml['rn_lambda1'] * ( T_star - 10.) + nml['rn_mu1'] * self.domain.gdept_0.isel(z_c=0)) * ( T_star - 10.)
+                + nml['rn_b0'] * (1. - 0.5 * nml['rn_lambda2'] * ( S_star - 35.) - nml['rn_mu2'] * self.domain.gdept_0.isel(z_c=0)) * ( S_star - 35.)
+                - nml['rn_nu'] * ( S_star - 10.) * ( S_star - 35.)
+            ) + 1026
+            return(rho.where(rho > 0))
+        else:
+            raise Exception('Only S-EOS has been implemented yet.')
     
     def get_rho(self):
         """
