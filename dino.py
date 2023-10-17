@@ -224,45 +224,55 @@ class Experiment:
 
     def get_T_star(self):
         """ Compute the temperature restoring profile. """
-        return(self.data.sst - (self.data.qns + self.data.empmr * self.data.sst * 3991.86795 + self.data.qsr) / self.namelist['namusr_def']['rn_trp'])
+        T_star = self.data.sst - (self.data.qns + self.data.empmr * self.data.sst * 3991.86795 + self.data.qsr) / self.namelist['namusr_def']['rn_trp']
+        return(T_star.where(self.domain.tmask.isel(z_c=0) == 1.))
         
     
     def get_S_star(self):
         """ Compute the salinity restoring profile. """
         if 'saltflx' in list(self.data.keys()):
-            return(self.data.sss - self.data.sflx  / self.namelist['namusr_def']['rn_srp'])
+            S_star = self.data.sss - self.data.saltflx  / self.namelist['namusr_def']['rn_srp']
+            return(S_star.where(self.domain.tmask.isel(z_c=0) == 1.))
         else:
             print('Warning: saltflux is not in the dataset. Assumed shape by Romain Caneill (2022).')
             return(37.12 * np.exp(- self.domain.gphit**2 / 260.**2 ) - 1.1 * np.exp( - self.domain.gphit**2 / 7.5**2 ))
     
     def get_rho_star(self):
-        """ Compute the density restoring profile from salinity and temperature restoring. """
+        """
+        Compute the density restoring profile from salinity and temperature restoring.
+        Referenced to surface pressure.
+        """
         T_star = self.get_T_star()
         S_star = self.get_S_star()
         nml = self.namelist['nameos']
         if nml['ln_seos']:
-            rho = (
-                - nml['rn_a0'] * (1. + 0.5 * nml['rn_lambda1'] * ( T_star - 10.) + nml['rn_mu1'] * self.domain.gdept_0.isel(z_c=0)) * ( T_star - 10.)
-                + nml['rn_b0'] * (1. - 0.5 * nml['rn_lambda2'] * ( S_star - 35.) - nml['rn_mu2'] * self.domain.gdept_0.isel(z_c=0)) * ( S_star - 35.)
+            rho_star = (
+                - nml['rn_a0'] * (1. + 0.5 * nml['rn_lambda1'] * ( T_star - 10.)) * ( T_star - 10.)
+                + nml['rn_b0'] * (1. - 0.5 * nml['rn_lambda2'] * ( S_star - 35.)) * ( S_star - 35.)
                 - nml['rn_nu'] * ( S_star - 10.) * ( S_star - 35.)
             ) + 1026
-            return(rho.where(rho > 0))
+            return(rho_star)
         else:
             raise Exception('Only S-EOS has been implemented yet.')
     
-    def get_rho(self):
+    def get_rho(self, z=0.):
         """
         Compute potential density referencedto the surface according to the EOS. 
         Uses gdepth_0 as depth for simplicity and allows only for S-EOS currently.
+
+            z = 0.          Reference pressure level [m]
         """
-        nml = self.namelist['nameos']
+        nml  = self.namelist['nameos']
+        # masking of T,S
+        soce = self.data.soce.where(self.domain.tmask == 1.)
+        toce = self.data.toce.where(self.domain.tmask == 1.)
         if nml['ln_seos']:
             rho = (
-                - nml['rn_a0'] * (1. + 0.5 * nml['rn_lambda1'] * ( self.data.toce - 10.) + nml['rn_mu1'] * self.domain.gdept_0) * ( self.data.toce - 10.)
-                + nml['rn_b0'] * (1. - 0.5 * nml['rn_lambda2'] * ( self.data.soce - 35.) - nml['rn_mu2'] * self.domain.gdept_0) * ( self.data.soce - 35.)
-                - nml['rn_nu'] * ( self.data.toce - 10.) * ( self.data.soce - 35.)
+                - nml['rn_a0'] * (1. + 0.5 * nml['rn_lambda1'] * ( toce - 10.) + nml['rn_mu1'] * z) * ( toce - 10.) 
+                + nml['rn_b0'] * (1. - 0.5 * nml['rn_lambda2'] * ( soce - 35.) - nml['rn_mu2'] * z) * ( soce - 35.) 
+                - nml['rn_nu'] * ( toce - 10.) * ( soce - 35.)
             ) + 1026
-            return(rho.where(rho > 0))
+            return(rho)
         else:
             raise Exception('Only S-EOS has been implemented yet.')
     
@@ -298,5 +308,52 @@ class Experiment:
         acc = (self.data.uoce.isel(x_f=0) * self.domain.e3u_0.isel(x_f=0) * self.domain.e2u.isel(x_f=0)).sum(['y_c', 'z_c']) / 1e6
         return(acc)
 
+    
+    def get_Zanna_Bolton(self, gamma=1.0):
+        """
+        Implementation of the Zanna & Bolton (2020) subgrid closure discovered by a machine learning algorithm.
+        The discretization of its operators follows Perezhogin.
+        """
+        dudx        = self.grid.diff(self.data.uoce * self.domain.umask / self.domain.e2u, 'X') * self.domain.e2t / self.domain.e1t
+        dvdy        = self.grid.diff(self.data.voce * self.domain.vmask / self.domain.e1v, 'Y') * self.domain.e1t / self.domain.e2t
+
+        dudy        = self.grid.diff(self.data.uoce / self.domain.e1u, 'Y') * self.domain.e1f / self.domain.e2f * self.domain.fmask
+        dvdx        = self.grid.diff(self.data.voce / self.domain.e2v, 'X') * self.domain.e1f / self.domain.e1f * self.domain.fmask
+
+        sh_xx       = dudx - dvdy       # Stretching deformation \tilde{D} on T-point
+        sh_xy       = dvdx + dudy       # Shearing deformation D on F-point 
+        vort_xy     = dvdx - dudy       # Relative vorticity \Zeta on F-point
+
+        kappa_t     = self.domain.e2t * self.domain.e1t * self.domain.tmask * gamma
+        kappa_f     = self.domain.e2f * self.domain.e1f * self.domain.fmask * gamma
+
+        # Interpolating defomation and vorticity on opposite grid-points
+        # TODO: different discretizations of the interpolation as proposed by Pavel
+        vort_xy_t   = self.grid.interp(vort_xy,['X', 'Y']) * self.domain.tmask
+        sh_xy_t     = self.grid.interp(sh_xy,['X', 'Y']) * self.domain.tmask
+        sh_xx_f     = self.grid.interp(sh_xx,['X', 'Y']) * self.domain.fmask
+
+        # Hydrostatic component of Txx/Tyy
+        sum_sq      = 0.5 * (vort_xy_t**2 + sh_xy_t**2 + sh_xx**2)
+        # Deviatoric component of Txx/Tyy        
+        vort_sh     = vort_xy_t * sh_xy_t
+
+        Txx         = - kappa_t * (- vort_sh + sum_sq)
+        Tyy         = - kappa_t * (+ vort_sh + sum_sq)
+        Txy         = - kappa_f * (vort_xy * sh_xx_f)
+
+        ZB2020u     = (self.grid.diff(Txx * self.data.e3t * self.domain.e2t**2, 'X') / self.domain.e2u      \
+                + self.grid.diff(Txy * self.domain.e3f * self.domain.e1f**2, 'Y') / self.domain.e1u)        \
+                / (self.domain.e1u * self.domain.e2u) / (self.data.e3u + 1e-70)
+
+        ZB2020v     = (self.grid.diff(Txy * self.data.e3f * self.domain.e2f**2, 'X') / self.domain.e2v      \
+                + self.grid.diff(Tyy * self.data.e3t * self.domain.e1t**2, 'Y') / self.domain.e1v)          \
+                / (self.domain.e1v * self.domain.e2v) / (self.data.e3v+1e-70)
+        
+        return {
+            'ZB2020u': ZB2020u, 'ZB2020v': ZB2020v, 
+            'Txx': Txx, 'Tyy': Tyy, 'Txy': Txy, 
+            'sh_xx': sh_xx, 'sh_xy': sh_xy, 'vort_xy': vort_xy,
+        }
 
 
