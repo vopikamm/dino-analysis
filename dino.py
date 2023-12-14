@@ -157,6 +157,13 @@ class Experiment:
 
         return(restart_regrid)
 
+    def regrid_emp(self, other, name='emp_climatology.nc'):
+        """
+        Regridding the EmP-field (name) onto another grid (other).
+        """
+        # Create two EmP climatology datasets with the respective coordinates as self/other.
+        emp_self = xr.open_dat
+
     def extrapolate_restart_on_land(self, lr):
         """ 
         Extrapolating a restart dataset onto land points.
