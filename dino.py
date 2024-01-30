@@ -19,6 +19,7 @@ class Experiment:
         self.path           = path + experiment_name + '/'
         self.restarts       = self.get_restarts(restarts)
         self.domain         = self.open_domain()
+        self.mask         = self.open_mask()
         self.namelist       = self.open_namelist()
         self.grid           = xg.Grid(self.domain, metrics=xn.get_metrics(self.domain), periodic=False)
         #chunks              = dict({'t_y':10, 't_m':120, 't_0':360})
@@ -63,9 +64,23 @@ class Experiment:
     def open_domain(self):
         """ Open the domain_cfg not lazy."""
         domain = xn.open_domain_cfg(
-            datadir=Path(self.path + self.restarts[0])
+            files=[self.path + self.restarts[0] + '/domain_cfg_out.nc']
         )
         return(domain)
+    
+    # def open_domain(self):
+    #     """ Open the domain_cfg not lazy."""
+    #     domain = xn.open_domain_cfg(
+    #         datadir=Path(self.path + self.restarts[0])
+    #     )
+    #     return(domain)
+
+    def open_mask(self):
+        """ Open the domain_cfg not lazy."""
+        mask = xn.open_domain_cfg(
+            files=[self.path + self.restarts[0] + '/mesh_mask.nc']
+        )
+        return(mask)
 
     def open_data(self, file_name):
         """ Open the data lazy. """
@@ -98,6 +113,7 @@ class Experiment:
             combine_attrs="drop_conflicts",
             data_vars="minimal",
             drop_variables=["x", "y"],
+            chunks={'nav_lev':1}
         )
         for i in [
             "DOMAIN_position_first",
@@ -204,7 +220,7 @@ class Experiment:
         # Compute density if necessary
         rho = self.get_rho(z=z).isel(z_c=slice(0,-1), **isel).rename('rho')
         # Mask boundary
-        rho = rho.where(self.domain.tmask == 1.0)
+        rho = rho.where(self.mask.tmask == 1.0)
         # define XGCM grid object with outer dimension z_f 
         grid = xg.Grid(ds_top,
             coords={
@@ -243,7 +259,7 @@ class Experiment:
             #+ self.data.empmr * self.data.sst * 3991.86795
             + self.data.qsr
         ) / self.namelist['namusr_def']['rn_trp']
-        return(T_star.where(self.domain.tmask.isel(z_c=0) == 1.))
+        return(T_star.where(self.mask.tmask.isel(z_c=0) == 1.))
     
     def get_emp(self, d=20, tolerance=1e-20):
         """
@@ -276,7 +292,7 @@ class Experiment:
         """ Compute the salinity restoring profile. """
         if 'saltflx' in list(self.data.keys()):
             S_star = self.data.sss - self.data.saltflx  / self.namelist['namusr_def']['rn_srp']
-            return(S_star.where(self.domain.tmask.isel(z_c=0) == 1.))
+            return(S_star.where(self.mask.tmask.isel(z_c=0) == 1.))
         else:
             print('Warning: saltflux is not in the dataset. Assumed shape by Romain Caneill (2022).')
             return(37.12 * np.exp(- self.domain.gphit**2 / 260.**2 ) - 1.1 * np.exp( - self.domain.gphit**2 / 7.5**2 ))
@@ -308,8 +324,8 @@ class Experiment:
         """
         nml  = self.namelist['nameos']
         # masking of T,S
-        soce = self.data.soce.where(self.domain.tmask == 1.)
-        toce = self.data.toce.where(self.domain.tmask == 1.)
+        soce = self.data.soce.where(self.mask.tmask == 1.)
+        toce = self.data.toce.where(self.mask.tmask == 1.)
         if nml['ln_seos']:
             rho = (
                 - nml['rn_a0'] * (1. + 0.5 * nml['rn_lambda1'] * ( toce - 10.) + nml['rn_mu1'] * z) * ( toce - 10.) 
@@ -327,9 +343,9 @@ class Experiment:
         """
         nml  = self.namelist['nameos']
         # masking of T, S, z
-        soce = self.data.soce.where(self.domain.tmask == 1.)
-        toce = self.data.toce.where(self.domain.tmask == 1.)
-        z    = self.domain.gdept_0.where(self.domain.tmask == 1.)
+        soce = self.data.soce.where(self.mask.tmask == 1.)
+        toce = self.data.toce.where(self.mask.tmask == 1.)
+        z    = self.domain.gdept_0.where(self.mask.tmask == 1.)
 
         if nml['ln_seos']:
             alpha   = ( nml['rn_a0'] * (1. + nml['rn_lambda1'] * ( toce - 10.) + nml['rn_mu1'] * z) + nml['rn_nu'] * soce ) / 1026.  
@@ -433,7 +449,7 @@ class Experiment:
         Nsq = (self.get_N_squared())
         res = xr.apply_ufunc(self._get_dynmodes, 
                              Nsq.isel(x_c=slice(1,-1), y_c=slice(1,-1), t_y=-1).chunk({'z_f':-1}),
-                             self.data.e3t.where(self.domain.tmask==1.0).isel(x_c=slice(1,-1), y_c=slice(1,-1), t_y=-1).chunk({'z_c':-1}),
+                             self.data.e3t.where(self.mask.tmask==1.0).isel(x_c=slice(1,-1), y_c=slice(1,-1), t_y=-1).chunk({'z_c':-1}),
                              self.data.e3w.isel(x_c=slice(1,-1), y_c=slice(1,-1), t_y=-1).chunk({'z_f':-1}),
                              input_core_dims=[['z_f'],['z_c'],['z_f']],
                              dask='parallelized', vectorize=True,
@@ -448,24 +464,24 @@ class Experiment:
         Implementation of the Zanna & Bolton (2020) subgrid closure discovered by a machine learning algorithm.
         The discretization of its operators follows Perezhogin.
         """
-        dudx        = self.grid.diff(self.data.uoce * self.domain.umask / self.domain.e2u, 'X') * self.domain.e2t / self.domain.e1t
-        dvdy        = self.grid.diff(self.data.voce * self.domain.vmask / self.domain.e1v, 'Y') * self.domain.e1t / self.domain.e2t
+        dudx        = self.grid.diff(self.data.uoce * self.mask.umask / self.domain.e2u, 'X') * self.domain.e2t / self.domain.e1t
+        dvdy        = self.grid.diff(self.data.voce * self.mask.vmask / self.domain.e1v, 'Y') * self.domain.e1t / self.domain.e2t
 
-        dudy        = self.grid.diff(self.data.uoce / self.domain.e1u, 'Y') * self.domain.e1f / self.domain.e2f * self.domain.fmask
-        dvdx        = self.grid.diff(self.data.voce / self.domain.e2v, 'X') * self.domain.e1f / self.domain.e1f * self.domain.fmask
+        dudy        = self.grid.diff(self.data.uoce / self.domain.e1u, 'Y') * self.domain.e1f / self.domain.e2f * self.mask.fmask
+        dvdx        = self.grid.diff(self.data.voce / self.domain.e2v, 'X') * self.domain.e1f / self.domain.e1f * self.mask.fmask
 
         sh_xx       = dudx - dvdy       # Stretching deformation \tilde{D} on T-point
         sh_xy       = dvdx + dudy       # Shearing deformation D on F-point 
         vort_xy     = dvdx - dudy       # Relative vorticity \Zeta on F-point
 
-        kappa_t     = self.domain.e2t * self.domain.e1t * self.domain.tmask * gamma
-        kappa_f     = self.domain.e2f * self.domain.e1f * self.domain.fmask * gamma
+        kappa_t     = self.domain.e2t * self.domain.e1t * self.mask.tmask * gamma
+        kappa_f     = self.domain.e2f * self.domain.e1f * self.mask.fmask * gamma
 
         # Interpolating defomation and vorticity on opposite grid-points
         # TODO: different discretizations of the interpolation as proposed by Pavel
-        vort_xy_t   = self.grid.interp(vort_xy,['X', 'Y']) * self.domain.tmask
-        sh_xy_t     = self.grid.interp(sh_xy,['X', 'Y']) * self.domain.tmask
-        sh_xx_f     = self.grid.interp(sh_xx,['X', 'Y']) * self.domain.fmask
+        vort_xy_t   = self.grid.interp(vort_xy,['X', 'Y']) * self.mask.tmask
+        sh_xy_t     = self.grid.interp(sh_xy,['X', 'Y']) * self.mask.tmask
+        sh_xx_f     = self.grid.interp(sh_xx,['X', 'Y']) * self.mask.fmask
 
         # Hydrostatic component of Txx/Tyy
         sum_sq      = 0.5 * (vort_xy_t**2 + sh_xy_t**2 + sh_xx**2)
